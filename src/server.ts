@@ -17,12 +17,19 @@ app.get("/health", (req, res) => {
     res.json({ status: "ok", timestamp: new Date().toISOString() });
 });
 
-// Main chat endpoint for n8n
-app.post("/api/chat", async (req, res) => {
+// Main chat handler
+const chatHandler = async (req: express.Request, res: express.Response) => {
+    const requestId = crypto.randomUUID().substring(0, 8);
+    console.log(`\n========== NEW REQUEST [${requestId}] ==========`);
+    console.log(`[${requestId}] Endpoint: ${req.path}`);
+    console.log(`[${requestId}] Timestamp:`, new Date().toISOString());
+    console.log(`[${requestId}] Body:`, JSON.stringify(req.body, null, 2));
+
     try {
         const { message, conversationId } = req.body as ChatRequest;
 
         if (!message) {
+            console.log(`[${requestId}] ERROR: Missing message field`);
             return res.status(400).json({
                 error: "Missing required field: message",
                 response: "",
@@ -30,36 +37,42 @@ app.post("/api/chat", async (req, res) => {
             } as ChatResponse);
         }
 
-        console.log(`[${new Date().toISOString()}] Processing message: ${message.substring(0, 50)}...`);
+        console.log(`[${requestId}] Processing message: "${message}"`);
 
         // Run the agent workflow
-        const result = await runWorkflow({ input_as_text: message });
+        console.log(`[${requestId}] Calling runWorkflow...`);
+        const result = await runWorkflow({
+            input_as_text: message,
+            conversationId: conversationId
+        });
+        console.log(`[${requestId}] Workflow completed`);
 
         const response: ChatResponse = {
-            response: result.output_text || JSON.stringify(result),
+            response: result.output_text ? `${result.output_text}` : JSON.stringify(result),
             classification: result.classification,
             conversationId: conversationId || crypto.randomUUID()
         };
 
-        console.log(`[${new Date().toISOString()}] Response classification: ${response.classification}`);
+        console.log(`[${requestId}] === FINAL RESPONSE ===`);
+        console.log(`[${requestId}] Classification: ${response.classification}`);
+        console.log(`[${requestId}] Response: ${response.response}`);
 
-        return res.json(response);
+        res.json(response);
+        console.log(`[${requestId}] Response sent successfully`);
+        console.log(`========== END REQUEST [${requestId}] ==========\n`);
     } catch (error) {
-        console.error("Error processing chat request:", error);
+        console.error(`[${requestId}] ERROR:`, error);
         return res.status(500).json({
             error: error instanceof Error ? error.message : "Internal server error",
             response: "Lo siento, hubo un error procesando tu mensaje. Por favor intenta de nuevo.",
             conversationId: crypto.randomUUID()
         } as ChatResponse);
     }
-});
+};
 
-// Webhook endpoint (alias for n8n compatibility)
-app.post("/webhook", async (req, res) => {
-    // Redirect to main chat endpoint
-    req.url = "/api/chat";
-    return app._router.handle(req, res, () => { });
-});
+// Endpoints
+app.post("/api/chat", chatHandler);
+app.post("/webhook", chatHandler);
 
 // Start server
 app.listen(PORT, () => {

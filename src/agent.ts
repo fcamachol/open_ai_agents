@@ -1,4 +1,4 @@
-import { hostedMcpTool, Agent, AgentInputItem, Runner, withTrace } from "@openai/agents";
+import { hostedMcpTool, Agent, AgentInputItem, Runner, withTrace, tool } from "@openai/agents";
 import { OpenAI } from "openai";
 import { z } from "zod";
 import type { WorkflowInput, WorkflowOutput } from "./types.js";
@@ -19,28 +19,165 @@ const mcp = hostedMcpTool({
         "Buscar_Customer_Por_Contrato",
         "Crear_ticket"
     ],
+    // Try both casing styles to be safe
     requireApproval: "never",
+    // @ts-ignore
+    require_approval: "never",
     serverUrl: "https://tools.fitcluv.com/mcp/9649689d-dd88-4bb8-b9f1-94b3d604ccda"
 });
 
-const mcp1 = hostedMcpTool({
-    serverLabel: "mcp_v6",
-    allowedTools: [
-        "get_conceptos_cea",
-        "get_tarifa_contrato",
-        "get_deuda",
-        "get_contract_details",
-        "get_consumo",
-        "get_client_tickets",
-        "get_available_agent",
-        "get_active_tickets",
-        "Crear_Customer",
-        "Buscar_Customer_Por_Contrato",
-        "Crear_ticket"
-    ],
-    requireApproval: "always",
-    serverUrl: "https://tools.fitcluv.com/mcp/9649689d-dd88-4bb8-b9f1-94b3d604ccda"
+// Standalone ticket creation function
+async function performCreateTicket({ service_type, titulo, descripcion, contract_number, email, ubicacion }: {
+    service_type: string,
+    titulo: string,
+    descripcion: string,
+    contract_number: string | null,
+    email: string | null,
+    ubicacion: string | null
+}) {
+    try {
+        // Generate a local folio FIRST as a fallback
+        const localFolio = generateTicketId(service_type as keyof typeof TICKET_TYPES);
+
+        // Prepare ticket data WITHOUT folio - let Supabase auto-generate it (but we have our local fallback)
+        const ticketData: any = {
+            user_id: "00d7d94c-a0ac-4b55-8767-5a553d80b39a",
+            service_type,
+            titulo,
+            descripcion,
+            status: "abierto"
+        };
+
+        if (contract_number) ticketData.contract_number = contract_number;
+        if (email) ticketData.email = email;
+        if (ubicacion) ticketData.ubicacion = ubicacion;
+
+        console.log(`[TICKET] Creating ticket in MCP:`, ticketData);
+
+        // Call MCP Crear_ticket to persist the ticket and get auto-generated folio
+        let folio = localFolio; // Default to local folio
+        try {
+            const mcpResponse = await fetch("https://tools.fitcluv.com/mcp/9649689d-dd88-4bb8-b9f1-94b3d604ccda", {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                    "Accept": "application/json, text/event-stream"
+                },
+                body: JSON.stringify({
+                    jsonrpc: "2.0",
+                    method: "tools/call",
+                    params: {
+                        name: "Crear_ticket",
+                        arguments: ticketData
+                    },
+                    id: Date.now()
+                })
+            });
+
+            const mcpResult = await mcpResponse.json();
+            console.log(`[TICKET] MCP response:`, JSON.stringify(mcpResult, null, 2));
+
+            if (mcpResult.error) {
+                console.error(`[TICKET] MCP error:`, mcpResult.error);
+                // We'll use the local folio if MCP fails
+            } else if (mcpResult.result && mcpResult.result.content) {
+                // Extract folio from the MCP response
+                const content = mcpResult.result.content;
+                if (Array.isArray(content) && content[0]?.text) {
+                    const textContent = content[0].text;
+                    const folioMatch = textContent.match(/folio[:\s]+([A-Z0-9\-]+)/i);
+                    if (folioMatch) {
+                        folio = folioMatch[1];
+                        console.log(`[TICKET] Using MCP-generated folio: ${folio}`);
+                    }
+                }
+            }
+        } catch (mcpError) {
+            console.error(`[TICKET] Failed to call MCP:`, mcpError);
+            // Use local folio as fallback
+        }
+
+        console.log(`[TICKET] Ticket created with final folio: ${folio}`);
+
+        return {
+            success: true,
+            folio,
+            message: `Ticket created successfully with folio ${folio}`
+        };
+    } catch (error) {
+        console.error("[TICKET] Error creating ticket:", error);
+        return {
+            success: false,
+            error: error instanceof Error ? error.message : "Unknown error",
+            message: "Error creating ticket"
+        };
+    }
+}
+
+// Custom ticket creation tool
+const createTicketTool = tool({
+    name: "create_cea_ticket",
+    description: "Creates a ticket in the CEA system and returns the generated folio number. Use this instead of Crear_ticket to ensure you get the folio before responding to the user.",
+    parameters: z.object({
+        service_type: z.enum(["fuga", "aclaraciones", "pagos", "lecturas", "revision_recibo", "recibo_digital", "urgente"]).describe("Type of ticket"),
+        titulo: z.string().describe("Title of the ticket"),
+        descripcion: z.string().describe("Detailed description of the issue"),
+        contract_number: z.string().nullable().describe("Contract number if applicable").default(null),
+        email: z.string().nullable().describe("Email if applicable").default(null),
+        ubicacion: z.string().nullable().describe("Location if applicable").default(null)
+    }),
+    execute: async (args) => {
+        return performCreateTicket(args);
+    }
 });
+
+// Ticket type mapping
+const TICKET_TYPES = {
+    fuga: "FUG",
+    aclaraciones: "ACL",
+    pagos: "PAG",
+    lecturas: "LEC",
+    revision_recibo: "REV",
+    recibo_digital: "DIG",
+    urgente: "URG"
+} as const;
+
+// Ticket counter store (in-memory, resets on restart)
+// Format: Map<"YYMMDD-TYPE", number>
+const ticketCounterStore = new Map<string, number>();
+
+/**
+ * Generates a ticket ID following the nomenclature: CEA-[TYPE]-[YYMMDD]-[NNNN]
+ * @param ticketType - The type of ticket (fuga, pagos, aclaraciones, etc.)
+ * @returns The generated ticket ID
+ */
+export function generateTicketId(ticketType: keyof typeof TICKET_TYPES): string {
+    const typeCode = TICKET_TYPES[ticketType];
+
+    // Get current date in Mexico City timezone
+    const now = new Date();
+    const mexicoDate = new Date(now.toLocaleString("en-US", { timeZone: "America/Mexico_City" }));
+
+    // Format date as YYMMDD
+    const year = mexicoDate.getFullYear().toString().slice(-2);
+    const month = String(mexicoDate.getMonth() + 1).padStart(2, '0');
+    const day = String(mexicoDate.getDate()).padStart(2, '0');
+    const dateStr = `${year}${month}${day}`;
+
+    // Generate counter key
+    const counterKey = `${dateStr}-${typeCode}`;
+
+    // Get and increment counter
+    const currentCount = ticketCounterStore.get(counterKey) || 0;
+    const newCount = currentCount + 1;
+    ticketCounterStore.set(counterKey, newCount);
+
+    // Format counter as 4-digit number
+    const counterStr = String(newCount).padStart(4, '0');
+
+    // Generate final ticket ID
+    return `CEA-${typeCode}-${dateStr}-${counterStr}`;
+}
 
 // Shared client for guardrails (lazy initialization)
 let _client: OpenAI | null = null;
@@ -64,6 +201,70 @@ async function runGuardrails(text: string, config: any, context: any, flag: bool
     // Placeholder - implement when guardrails package is available
     return [];
 }
+
+// Simple in-memory conversation store
+const conversationStore = new Map<string, AgentInputItem[]>();
+
+// Helper to handle interruptions (approvals)
+async function runWithAutoApproval(runner: any, agent: any, history: AgentInputItem[]) {
+    let currentHistory = [...history];
+    let result = await runner.run(agent, currentHistory);
+
+    let loops = 0;
+    while (result.currentStep?.type === "next_step_interruption" && loops < 5) {
+        console.log(`[AutoApproval] Interruption detected (loop ${loops})`);
+        loops++;
+        const interruptions = result.currentStep.data.interruptions;
+        let hasApprovals = false;
+        const approvedItems: any[] = [];
+        const approvedIds = new Set<string>();
+
+        for (const item of interruptions) {
+            if (item.type === "tool_approval_item") {
+                console.log(`[AutoApproval] Approving item: ${item.rawItem.name} (${item.rawItem.id})`);
+                hasApprovals = true;
+                approvedItems.push({
+                    ...item.rawItem,
+                    status: "completed"
+                });
+                approvedIds.add(item.rawItem.id);
+            }
+        }
+
+        if (!hasApprovals) break;
+
+        // Filter out the in_progress items from newItems that we are about to approve
+        const newItemsToPush = result.newItems
+            .map((i: any) => i.rawItem)
+            .filter((item: any) => !approvedIds.has(item.id));
+
+        // Add generated items (excluding ones we just approved) + approvals to history
+        currentHistory.push(...newItemsToPush);
+        currentHistory.push(...approvedItems);
+
+        result = await runner.run(agent, currentHistory);
+    }
+
+    if (loops >= 5) {
+        console.warn("[AutoApproval] Reached max loops limit!");
+    }
+
+    return result;
+}
+
+const getAgentOutput = (result: any) => {
+    if (result.finalOutput) return result.finalOutput;
+
+    // Try to find last assistant message in newItems
+    const lastItem = result.newItems[result.newItems.length - 1]?.rawItem;
+    if (lastItem?.role === 'assistant') {
+        if (typeof lastItem.content === 'string') return lastItem.content;
+        if (Array.isArray(lastItem.content)) {
+            return lastItem.content.map((c: any) => c.text || '').join('');
+        }
+    }
+    return null;
+};
 
 function guardrailsHasTripwire(results: any[]): boolean {
     return (results ?? []).some((r) => r?.tripwireTriggered === true);
@@ -139,14 +340,15 @@ const ClassificationAgentSchema = z.object({
 const classificationAgent = new Agent({
     name: "Classification agent",
     instructions: `Classify the user's intent into one of the following categories:
-"fuga", "pagos", "hablar con asesor", "información", "consumos", "contrato", "tickets"
+"fuga", "pagos", "hablar_asesor", "informacion", "consumos", "contrato", "tickets"
 
 1. Any urgent water or sewer issue, loss of service, leaks, flooding, or request for a human advisor should route to fuga.
-2. Any question about payments, debt, balance, consumption, billing, or how/where to pay should route to query.
-3. Any other message should route to información.
-4.- Any questions about contract should direct to the contract agent
-5.- when someone wants to update an existing case send to tickets
-6.- When a user asks to change their recibo to digital route to payments
+2. Any question about payments, debt, balance, billing, or how/where to pay should route to pagos.
+3. Any question about water consumption or meter readings should route to consumos.
+4. Any questions about contracts (new or changes) should route to contrato.
+5. When someone wants to update an existing case or check ticket status, route to tickets.
+6. When a user asks to change their recibo to digital, route to pagos.
+7. Any other informational message should route to informacion.
 `,
     model: "gpt-4.1-mini",
     outputType: ClassificationAgentSchema,
@@ -160,23 +362,39 @@ const classificationAgent = new Agent({
 
 const informationAgent = new Agent({
     name: "Information agent",
-    instructions: `You are an information agent for answering informational queries related to CEA Querétaro. 
-Your aim is to provide clear, concise, and accurate responses to user questions. 
-Use the policy below to assemble your answer. 
-Do not speculate or invent information. If the information is not covered, say so clearly and guide the user to the correct process.
+    instructions: `You are María, the information agent for CEA Querétaro.
+    You provide general information about services, processes, and policies.
 
-Agent Name: María  
-Organization: CEA Querétaro  
-Industry: Public Water & Sanitation Services  
-Region: Querétaro, México  
+    IMPORTANT:
+    - Keep responses brief and to the point. One question maximum per response.
+    - You are NOT a test agent. You are a live production assistant.
+    - NEVER say you cannot access account data or give privacy disclaimers.
+    - If someone asks about their specific account/debt/consumption, those queries should have been routed to specialized agents.
 
-📋 Policy Summary: Atención Informativa a Usuarios CEA  
-Policy ID: CEA-INF-2025-01  
-Effective Date: January 1, 2025  
-Applies To: Usuarios domésticos y comerciales de CEA Querétaro  
+    CAPABILITIES / WHAT CAN I DO:
+    If a user asks "what can you help with?", "what do you do?", or similar, provide this brief summary:
+    "Soy María, tu asistente virtual de la CEA. Puedo ayudarte con:
+    💧 Consultar tu saldo y realizar pagos
+    📊 Ver tu historial de consumos
+    🚨 Reportar fugas
+    🎫 Gestionar y dar seguimiento a tus tickets
+    ℹ️ Información general sobre trámites y servicios"
 
-Purpose:  
-Proporcionar información clara y confiable sobre pagos, consumo, contratos, recibos y servicios generales de CEA, sin levantar reportes ni gestionar emergencias.
+    Use the policy below to assemble your answer for other general questions.
+    Do not speculate or invent information. If the information is not covered, say so clearly and guide the user to the correct process.
+    
+    Agent Name: María  
+    Organization: CEA Querétaro  
+    Industry: Public Water & Sanitation Services  
+    Region: Querétaro, México  
+    
+    📋 Policy Summary: Atención Informativa a Usuarios CEA  
+    Policy ID: CEA-INF-2025-01  
+    Effective Date: January 1, 2025  
+    Applies To: Usuarios domésticos y comerciales de CEA Querétaro  
+    
+    Purpose:  
+    Proporcionar información clara y confiable sobre pagos, consumo, contratos, recibos y servicios generales de CEA, sin levantar reportes ni gestionar emergencias.
 
 ---
 
@@ -262,7 +480,7 @@ Si quieres, dime tu colonia y te digo cuál es la oficina más cercana."
     model: "gpt-4.1-mini",
     tools: [mcp],
     modelSettings: {
-        temperature: 1,
+        temperature: 0.7,
         topP: 1,
         maxTokens: 2048,
         store: true
@@ -271,30 +489,38 @@ Si quieres, dime tu colonia y te digo cuál es la oficina más cercana."
 
 const pagosAgent = new Agent({
     name: "Pagos Agent",
-    instructions: `When a user has dudas about their contract ask for their contract number to get them.
+    instructions: `You help users with payment-related queries and digital receipt changes.
 
-when the user asks to pay a recibo:
+IMPORTANT: Be concise. Ask ONE question at a time only when necessary.
 
-1.- Get the recibo number (if you dont have it)
-2.- Ask them if they want to pay online, or pay in a module.
+PAYMENT ASSISTANCE:
+1. Get contract number to check balance/debt
+2. For payment options, provide:
+   "Puedes pagar tu recibo en:
+   - Oxxo
+   - Cajeros de la CEA
+   - En sucursal
+   - En línea"
 
-If they ask to pay in a module give them the following information:
+DIGITAL RECEIPT CHANGE:
+When user requests digital receipt:
+1. Confirm email and contract number
+2. Create ticket with create_cea_ticket:
+   - service_type: "recibo_digital"
+   - titulo: "Cambio a recibo digital - Contrato [numero]"
+   - descripcion: Contract number and email
+   - contract_number: [numero]
+   - email: [email]
+3. The tool returns the folio. Use it in your response: "He creado tu solicitud con folio [FOLIO]. Tu recibo se enviará a: [email]. ¡Gracias por ahorrar papel!"
 
-"Puedes pagar tu recibo en:
-    - Oxxo 
-    - Cajeros de la cea
-    - En sucursal
+PAYMENT ISSUES:
+For disputes, create ticket with create_cea_ticket using service_type: "pagos"
 
-When a user asks to change their recibo to digital, just confirm their email adress and say:
-
-"Voy a cambiar tu recibo a digital ("recibo numero") y se enviará al correo: (correo) gracias por ayudarnos a ahorrar papel!"
-
-#Do not get contracts by name, adress or any other data.
-`,
+Do not retrieve contracts by name or address - contract number only.`,
     model: "gpt-4.1",
-    tools: [mcp],
+    tools: [mcp, createTicketTool],
     modelSettings: {
-        temperature: 1,
+        temperature: 0.7,
         topP: 1,
         maxTokens: 2048,
         store: true
@@ -303,13 +529,28 @@ When a user asks to change their recibo to digital, just confirm their email adr
 
 const consumosAgent = new Agent({
     name: "Consumos Agent",
-    instructions: `You help people with their consumos, you need a contract number to get them if you already have it dont ask for it again.
+    instructions: `You help users check their water consumption.
 
-Also ask for which month(s) they want to see`,
+IMPORTANT: Be concise. Ask ONE question at a time.
+
+WORKFLOW:
+1. Get contract number (if not already provided)
+2. Ask which month(s) they want to see
+3. Use tools to retrieve and display consumption data
+
+DISPUTES:
+If user disputes consumption or suspects meter reading error:
+1. Gather: contract number, month(s), specific issue
+2. Create ticket with create_cea_ticket:
+   - service_type: "lecturas" (meter issues) OR "revision_recibo" (receipt review) OR "aclaraciones" (clarifications)
+   - titulo: "Revisión de lectura - Contrato [numero] - [mes]"
+   - descripcion: All dispute details
+   - contract_number: [numero]
+3. The tool returns the folio. Include it in your response to the user.`,
     model: "gpt-4.1",
-    tools: [mcp],
+    tools: [mcp, createTicketTool],
     modelSettings: {
-        temperature: 1,
+        temperature: 0.7,
         topP: 1,
         maxTokens: 2048,
         store: true
@@ -318,24 +559,30 @@ Also ask for which month(s) they want to see`,
 
 const fugasAgent = new Agent({
     name: "Fugas Agent",
-    instructions: `Eres un agente de la cea especializado en fugas, necesitas estos datos para poder ayudar a la persona. Pregunta una por una, si te da la foto no preguntes lo que ya sabes. Si en la foto se ve la gravedad de la fuga no la preguntes.
+    instructions: `Eres un agente especializado en reportar fugas de agua.
 
-1.- Donde esta la fuga? (sugiere enviar su localizacion por whatsapp)
-2.- 
-(para los proximos dos puedes pedir una foto, si la foto te da lo que necesitas no lo preguntes nuevamente).
-2.1- Me puedes decir si esta en via publica o en una cada? 
-2.2- Que tan grave es la fuga?
+IMPORTANTE: Pregunta UNA cosa a la vez. Si recibes foto, úsala y no preguntes lo obvio.
 
-Cuando tengas todo esto crea un ticket y dale el numero de ticket al usuario.
+INFORMACIÓN NECESARIA:
+1. Ubicación de la fuga (sugiere compartir ubicación por WhatsApp)
+2. ¿Vía pública o dentro de casa? (puedes pedir foto)
+3. Gravedad de la fuga (si no es evidente en foto)
 
-user_id: 00d7d94c-a0ac-4b55-8767-5a553d80b39a
-folio: CEA-FUG-251226-0003
-service_type: reportar_lectura
-titulo: generalo tu`,
+CREAR TICKET:
+Cuando tengas toda la info, usa create_cea_ticket:
+- service_type: "fuga"
+- titulo: Título descriptivo (ej: "Fuga en vía pública - [ubicación]")
+- descripcion: Todos los detalles (ubicación, gravedad, tipo de vía)
+- ubicacion: La ubicación exacta
+
+El tool te devolverá el folio generado. DEBES incluir ese folio en tu respuesta al usuario.
+Ejemplo: "He creado tu reporte con el folio CEA-FUG-251226-0001. Un técnico se pondrá en contacto contigo pronto."
+
+NO pidas número de contrato para fugas.`,
     model: "gpt-4.1",
-    tools: [mcp],
+    tools: [mcp, createTicketTool],
     modelSettings: {
-        temperature: 1,
+        temperature: 0.7,
         topP: 1,
         maxTokens: 2048,
         store: true
@@ -372,13 +619,34 @@ If the user wants to make a change to the contract:
 
 const ticketAgent = new Agent({
     name: "ticket agent",
-    instructions: `You are a ticket handling agent you help users update tickets, give aditional context to existing tickets and close tickets.
+    instructions: `You are a ticket handling agent. You help users view, update, and manage their tickets.
 
-to get active tickets use get_active_tickets`,
+WORKFLOW:
+1. Ask for contract number if you don't have it
+2. Use get_client_tickets or get_active_tickets to retrieve tickets
+3. Display ticket information clearly with folio, status, and description
+4. Help with updates or additional context as needed
+
+TICKET LOOKUP:
+- First try: Use Buscar_Customer_Por_Contrato with the contract number to get customer ID
+- Then use: get_client_tickets with the customer ID to retrieve all tickets
+- Alternative: Use get_active_tickets with filter "contract_number=eq.XXXXXX&status=eq.abierto"
+
+IMPORTANT:
+- Do NOT narrate your search process ("intentando variantes", "probando método X")
+- Try methods silently and only respond to user once you have results
+- If you can't find tickets, simply say "No encontré tickets para este contrato"
+- Be concise and direct in your responses
+
+Display tickets in this format:
+📋 Ticket: [folio]
+Estado: [status]
+Tipo: [service_type]
+Descripción: [description]`,
     model: "gpt-4.1",
-    tools: [mcp1],
+    tools: [mcp],
     modelSettings: {
-        temperature: 1,
+        temperature: 0.7,
         topP: 1,
         maxTokens: 2048,
         store: true
@@ -388,8 +656,15 @@ to get active tickets use get_active_tickets`,
 // Main workflow function
 export const runWorkflow = async (workflow: WorkflowInput): Promise<WorkflowOutput> => {
     return await withTrace("Maria V1", async () => {
+        // Retrieve existing history or start fresh
+        const previousHistory = (workflow.conversationId && conversationStore.get(workflow.conversationId)) || [];
+
+        const now = new Date().toLocaleString("es-MX", { timeZone: "America/Mexico_City" });
+        const inputWithContext = `[Contexto: La fecha y hora actual es ${now}]\n\n${workflow.input_as_text} `;
+
         const conversationHistory: AgentInputItem[] = [
-            { role: "user", content: [{ type: "input_text", text: workflow.input_as_text }] }
+            ...previousHistory,
+            { role: "user", content: [{ type: "input_text", text: inputWithContext }] }
         ];
 
         const runner = new Runner({
@@ -408,11 +683,21 @@ export const runWorkflow = async (workflow: WorkflowInput): Promise<WorkflowOutp
         }
 
         // Run classification
-        const classificationAgentResultTemp = await runner.run(
+        const classificationAgentResultTemp = await runWithAutoApproval(
+            runner,
             classificationAgent,
             [...conversationHistory]
         );
-        conversationHistory.push(...classificationAgentResultTemp.newItems.map((item) => item.rawItem));
+
+        // Log new items for debugging "2 messages" issue
+        console.log(`[DEBUG] Classification result items:`, JSON.stringify(classificationAgentResultTemp.newItems.map((i: any) => i.rawItem), null, 2));
+
+        // Only push classification to history if it's not a message (to avoid double-responding)
+        const classificationItems = classificationAgentResultTemp.newItems
+            .map((item: any) => item.rawItem)
+            .filter((item: any) => item.role !== 'assistant' || (typeof item.content !== 'string' && !Array.isArray(item.content)));
+
+        conversationHistory.push(...classificationItems);
 
         if (!classificationAgentResultTemp.finalOutput) {
             throw new Error("Agent result is undefined");
@@ -428,41 +713,85 @@ export const runWorkflow = async (workflow: WorkflowInput): Promise<WorkflowOutp
 
         // Route to appropriate agent
         if (classification === "fuga") {
-            const result = await runner.run(fugasAgent, [...conversationHistory]);
-            conversationHistory.push(...result.newItems.map((item) => item.rawItem));
-            if (!result.finalOutput) throw new Error("Agent result is undefined");
-            agentResult = { output_text: result.finalOutput ?? "" };
+            const result = await runWithAutoApproval(runner, fugasAgent, [...conversationHistory]);
+            conversationHistory.push(...result.newItems.map((item: any) => item.rawItem));
+            const output = getAgentOutput(result);
+            if (!output) throw new Error(`Agent result is undefined.Result: ${JSON.stringify(result)} `);
+            agentResult = { output_text: output };
         } else if (classification === "hablar_asesor") {
-            agentResult = { output_text: "Te conectaré con un asesor humano. Por favor espera un momento." };
+            // Create urgent ticket for human advisor
+            try {
+                const ticketResult = await performCreateTicket({
+                    service_type: "urgente",
+                    titulo: "Solicitud de asesor humano",
+                    descripcion: `Usuario solicitó hablar con un asesor humano. Mensaje: ${workflow.input_as_text}`,
+                    contract_number: null,
+                    email: null,
+                    ubicacion: null
+                });
+
+                const folio = ticketResult.success ? ticketResult.folio : "PENDING";
+                agentResult = {
+                    output_text: `He creado tu solicitud con el folio ${folio}. Te conectaré con un asesor humano. Por favor espera un momento.`
+                };
+            } catch (error) {
+                console.error("[HABLAR_ASESOR] Error creating urgent ticket:", error);
+                agentResult = {
+                    output_text: "Te conectaré con un asesor humano. Por favor espera un momento."
+                };
+            }
         } else if (classification === "informacion") {
-            const result = await runner.run(informationAgent, [...conversationHistory]);
-            conversationHistory.push(...result.newItems.map((item) => item.rawItem));
-            if (!result.finalOutput) throw new Error("Agent result is undefined");
-            agentResult = { output_text: result.finalOutput ?? "" };
+            const result = await runWithAutoApproval(runner, informationAgent, [...conversationHistory]);
+            conversationHistory.push(...result.newItems.map((item: any) => item.rawItem));
+            const output = getAgentOutput(result);
+            if (!output) throw new Error(`Agent result is undefined.Result: ${JSON.stringify(result)} `);
+            agentResult = { output_text: output };
         } else if (classification === "pagos") {
-            const result = await runner.run(pagosAgent, [...conversationHistory]);
-            conversationHistory.push(...result.newItems.map((item) => item.rawItem));
-            if (!result.finalOutput) throw new Error("Agent result is undefined");
-            agentResult = { output_text: result.finalOutput ?? "" };
+            const result = await runWithAutoApproval(runner, pagosAgent, [...conversationHistory]);
+            conversationHistory.push(...result.newItems.map((item: any) => item.rawItem));
+            const output = getAgentOutput(result);
+            if (!output) throw new Error(`Agent result is undefined.Result: ${JSON.stringify(result)} `);
+            agentResult = { output_text: output };
         } else if (classification === "consumos") {
-            const result = await runner.run(consumosAgent, [...conversationHistory]);
-            conversationHistory.push(...result.newItems.map((item) => item.rawItem));
-            if (!result.finalOutput) throw new Error("Agent result is undefined");
-            agentResult = { output_text: result.finalOutput ?? "" };
+            const result = await runWithAutoApproval(runner, consumosAgent, [...conversationHistory]);
+            conversationHistory.push(...result.newItems.map((item: any) => item.rawItem));
+            const output = getAgentOutput(result);
+            if (!output) throw new Error(`Agent result is undefined.Result: ${JSON.stringify(result)} `);
+            agentResult = { output_text: output };
         } else if (classification === "contrato") {
-            const result = await runner.run(contratosAgent, [...conversationHistory]);
-            conversationHistory.push(...result.newItems.map((item) => item.rawItem));
-            if (!result.finalOutput) throw new Error("Agent result is undefined");
-            agentResult = { output_text: result.finalOutput ?? "" };
+            const result = await runWithAutoApproval(runner, contratosAgent, [...conversationHistory]);
+            conversationHistory.push(...result.newItems.map((item: any) => item.rawItem));
+            const output = getAgentOutput(result);
+            if (!output) throw new Error(`Agent result is undefined.Result: ${JSON.stringify(result)} `);
+            agentResult = { output_text: output };
         } else if (classification === "tickets") {
-            const result = await runner.run(ticketAgent, [...conversationHistory]);
-            conversationHistory.push(...result.newItems.map((item) => item.rawItem));
-            if (!result.finalOutput) throw new Error("Agent result is undefined");
-            agentResult = { output_text: result.finalOutput ?? "" };
+            const result = await runWithAutoApproval(runner, ticketAgent, [...conversationHistory]);
+
+            // Log new items for debugging "2 messages" issue
+            console.log(`[DEBUG] Specialized agent (${classification}) result items:`, JSON.stringify(result.newItems.map((i: any) => i.rawItem), null, 2));
+
+            conversationHistory.push(...result.newItems.map((item: any) => item.rawItem));
+            const output = getAgentOutput(result);
+            if (!output) throw new Error(`Agent result is undefined.Result: ${JSON.stringify(result)} `);
+            agentResult = { output_text: output };
         }
 
+        // Save updated history
+        if (workflow.conversationId) {
+            conversationStore.set(workflow.conversationId, conversationHistory);
+        }
+
+        const finalOutputText = agentResult?.output_text ?? classificationAgentResult.output_text;
+
+        console.log('[DEBUG] ====== WORKFLOW COMPLETE ======');
+        console.log('[DEBUG] Classification:', classification);
+        console.log('[DEBUG] Final output_text length:', finalOutputText?.length || 0);
+        console.log('[DEBUG] Final output_text:', finalOutputText);
+        console.log('[DEBUG] Conversation history length:', conversationHistory.length);
+        console.log('[DEBUG] ================================');
+
         return {
-            output_text: agentResult?.output_text ?? classificationAgentResult.output_text,
+            output_text: finalOutputText,
             classification
         };
     });

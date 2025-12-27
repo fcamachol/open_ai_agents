@@ -10,8 +10,18 @@ export interface ChatResponse {
     error?: string;
 }
 
+export type TicketType =
+    | "fuga"              // FUG - Fugas/Leaks
+    | "aclaraciones"      // ACL - Clarifications
+    | "pagos"             // PAG - Payments
+    | "lecturas"          // LEC - Meter readings
+    | "revision_recibo"   // REV - Receipt review
+    | "recibo_digital"    // DIG - Digital receipt
+    | "urgente";          // URG - Urgent (human advisor)
+
 export interface WorkflowInput {
     input_as_text: string;
+    conversationId?: string;
 }
 
 export interface WorkflowOutput {
